@@ -1,9 +1,11 @@
 import tournament from './components/tournament.js';
+import VueFlashMessage from './components/VueFlashMessage/index.js';
+Vue.use(VueFlashMessage);
 
 Vue.mixin({
   data () {
     return {
-      rarityorder: {"Starter":5,"Common":4, "Rare":3, "Epic":2, "Legendary":1},
+      rarityorder: {"Starter":10,"Common":5, "Rare":4, "Epic":3, "Legendary":2, "Unique":1},
       mixed_teams: [
         {"code":"aog",  "name":"Alliance of Goodness",   "races":['Bretonnian' , 'Human', 'Dwarf', 'Halfling', 'Wood Elf'] },
         {"code":"au",   "name":'Afterlife United',       "races":['Undead','Necromantic','Khemri','Vampire']},
@@ -37,6 +39,9 @@ Vue.mixin({
         case "Legendary":
           klass = "table-warning";
           break;
+        case "Unique":
+          klass = "table-success";
+          break;
       }
       return klass;
     },
@@ -68,6 +73,7 @@ var app = new Vue({
         menu: "Coaches",
         search_timeout: null,
         user:{},
+        processing: false,
       }
     },
     components: {
@@ -75,6 +81,11 @@ var app = new Vue({
     },
     delimiters: ['[[',']]'],
     methods: {
+      updateTournament(tournament) {
+        const idx = this.tournaments.findIndex(x => x.id === parseInt(tournament.id));
+        Vue.set(this.tournaments, idx, tournament);
+        this.selectCoach();
+      },
       getCoach(id) {
         const path = "/coaches/"+id;
         axios.get(path)
@@ -92,7 +103,7 @@ var app = new Vue({
         axios.get(path)
           .then((res) => {
             this.user = res.data.user;
-            this.get('loadedUser');
+            this.$emit('loadedUser');
           })
           .catch((error) => {
             console.error(error);
@@ -145,7 +156,7 @@ var app = new Vue({
         return cards.slice().sort(compare);
       },
 
-      sortedCardsWithQuantity(cards,filter="") {
+      sortedCardsWithoutQuantity(cards,filter="") {
         let tmp_cards;
         if (!this.show_starter) {
           tmp_cards =  cards.filter(function(i) { return i.id != null});
@@ -158,11 +169,15 @@ var app = new Vue({
         }
 
         if (this.selected_team!="All" && filter=="Player") {
-          races = this.mixed_teams.find((e) => { return e.name == this.selected_team }).races;
-          tmp_cards =  tmp_cards.filter(function(i) { return races.includes(i.race)});
+          const races = this.mixed_teams.find((e) => { return e.name == this.selected_team }).races;
+          tmp_cards =  tmp_cards.filter(function(i) { return i.race.split("/").some((r) => races.includes(r))});
         }
-        var new_collection = {}
-        const sorted = this.sortedCards(tmp_cards);
+        return this.sortedCards(tmp_cards);
+      },
+
+      sortedCardsWithQuantity(cards,filter="") {
+        let new_collection = {}
+        const sorted = this.sortedCardsWithoutQuantity(cards,filter);
         for (let i=0, len = sorted.length; i<len; i++) {
           if (new_collection.hasOwnProperty(sorted[i].name)) {
             new_collection[sorted[i].name]['quantity'] += 1
@@ -195,9 +210,78 @@ var app = new Vue({
         return this.tournaments.filter((e)=>{
           return coach.tournaments.includes(e.id);
         })
-      }
+      },
+      is_duster() {
+        return (this.loggedCoach.duster && this.loggedCoach.duster.type ? true : false);
+      },
+      is_in_duster(card) {
+        return (this.is_duster() ? this.loggedCoach.duster.cards.includes(card.id) : false);
+      },
+      is_duster_full() {
+        return (this.is_duster() ? this.loggedCoach.duster.cards.length==10 : false);
+      },
+      is_duster_open() {
+        return (this.is_duster() && this.loggedCoach.duster.status=="OPEN" ? true : false);
+      },
+      dust_add(card) {
+        this.dust("add",card);
+      },
+      dust_remove(card) {
+        this.dust("remove",card);
+      },
+      dust_cancel() {
+        this.dust("cancel");
+      },
+      dust_commit() {
+        this.dust("commit");
+      },
+      dust(method,card) {
+        let path;
+        if(card) {
+          path = "/duster/"+method+"/"+card.id;
+        } else {
+          path = "/duster/"+method;
+        }
+        let msg;
+        this.processing=true;
+        axios.get(path)
+        .then((res) => {
+            if(method=="add") {
+                msg = "Card "+card.name+" flagged for dusting";
+            } 
+            else if(method=="remove") {
+                msg = "Card "+card.name+" - dusting flag removed";
+            }
+            else if(method=="cancel") {
+              msg = "Dusting cancelled";
+            }
+            else if(method=="commit") {
+              const free_cmd = (res.data.type=="Tryouts" ? "!genpack player <type>" : "!genpack training or !genpack special");
+              msg = "Dusting committed! Use "+free_cmd+" to generate a free pack!";
+            }
+            this.loggedCoach.duster=res.data;
+            this.flash(msg, 'success',{timeout: 3000});
+        })
+        .catch((error) => {
+            if (error.response) {
+                this.flash(error.response.data.message, 'error',{timeout: 3000});
+            } else {
+                console.error(error);
+            }
+        })
+        .then(() => {
+            this.processing=false;
+        });
+    },
     },
     computed: {
+      duster_type() {
+        if(this.is_duster()) {
+          return this.loggedCoach.duster.type;
+        } else {
+          return "No dusting in progress";
+        }
+      },
       orderedCoaches() {
         return this.coaches.sort(function(a,b) {
           return a.name.localeCompare(b.name);
@@ -242,6 +326,7 @@ var app = new Vue({
     mounted() {
       this.$on('loadedUser', this.selectCoach);
       this.$on('loadedCoaches', this.selectCoach);
+      this.$on('updateTournament', this.updateTournament);
     },
     beforeMount() {
       this.getUser();

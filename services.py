@@ -4,6 +4,7 @@ from imperiumbase import ImperiumSheet
 from sqlalchemy.orm import joinedload
 from sqlalchemy import asc
 import random
+import requests
 
 class PackService:
 
@@ -308,6 +309,18 @@ class CoachService:
             db.session.delete(coach)
         db.session.commit()
 
+class NotificationService:
+    notificators = []
+
+    @classmethod
+    def notify(cls,msg):
+        for notificator in cls.notificators:
+            notificator(msg)
+
+    @classmethod
+    def register_notifier(cls,func):
+        cls.notificators.append(func)
+
 class TournamentService:
     @classmethod
     def init_dict_from_tournament(cls,tournament):
@@ -421,6 +434,12 @@ class TournamentService:
             coach.make_transaction(t)
 
             db.session.commit()
+            if tournament.fee>0:
+                coach_mention=f'<@{coach.disc_id}>'
+            else:
+                coach_mention=coach.short_name()
+
+            NotificationService.notify(f'{coach_mention} successfuly signed to {tournament.id}. {tournament.name} - fee {tournament.fee} coins')
         except Exception as e:
             raise RegistrationError(str(e))
 
@@ -430,7 +449,7 @@ class TournamentService:
     def unregister(cls,tournament,coach,admin=False,refund=True):
         # check for status
         if tournament.status not in ["OPEN","FINISHED"] and not admin:
-            raise RegistrationError(f"Coach resign from running tournament!!!")
+            raise RegistrationError(f"Coach cannot resign from running tournament!!!")
         # check if coach is registered
         ts = TournamentSignups.query.filter_by(tournament_id= tournament.id, coach_id = coach.id).all()
         if len(ts)<1:
@@ -445,6 +464,15 @@ class TournamentService:
                 coach.make_transaction(t)
 
             db.session.commit()
+
+            if refund and tournament.fee>0:
+                coach_mention=f'<@{coach.disc_id}>'
+                fee_msg = f" - refund {tournament.fee} coins"
+            else:
+                coach_mention=coach.short_name()
+                fee_msg=""
+
+            NotificationService.notify(f'{coach_mention} successfuly resigned from {tournament.id}. {tournament.name}{fee_msg}')
         except Exception as e:
             raise RegistrationError(str(e))
 
@@ -467,6 +495,92 @@ class DusterService:
             else:
                 duster.type = "Drills"
         duster.cards.append(card)
+        db.session.commit()
+    
+    @classmethod
+    def check_and_dust(cls,coach,card):
+        if card.coach.id != coach.id:
+            raise DustingError("Coach ID mismatch!!!")
+        duster = cls.get_duster(coach)
+        if duster.status!="OPEN":
+            raise DustingError(f"Dusting has been already committed, please generate the pack before dusting again")
+        if len(duster.cards)==10:
+            raise DustingError(f"Card **{card.name}** - cannot be dusted, duster is full")
+        if duster.type=="Tryouts" and card.card_type!="Player":
+            raise DustingError(f"Card **{card.name}** - cannot be used in {duster.type}")
+        if duster.type=="Drills" and card.card_type=="Player":
+            raise DustingError(f"Card **{card.name}** - cannot be used in {duster.type}")
+
+        cls.dust_card(duster,card)
+        return f"Card **{card.name}** - flagged for dusting"
+
+    @classmethod
+    def check_and_undust(cls,coach,card):
+        if card.coach.id != coach.id:
+            raise DustingError("Coach ID mismatch!!!")
+
+        card.duster_id = None
+        db.session.commit()
+        return f"Card **{card.name}** - dusting flag removed"
+
+    @classmethod
+    def dust_card_by_name(cls,coach,card_name):
+        card=CardService.get_undusted_Card_from_coach(coach,card_name)
+        if card is None:
+            raise DustingError(f"Card **{card_name}** - not found, check spelling, or maybe it is already dusted")
+        return cls.check_and_dust(coach,card)
+
+    @classmethod
+    def undust_card_by_name(cls,coach,card_name):
+        card=CardService.get_dusted_Card_from_coach(coach,card_name)
+        if card is None:
+            raise DustingError(f"Card **{card_name}** - not flagged for dusting")
+        return cls.check_and_undust(coach,card)
+
+    @classmethod
+    def dust_card_by_id(cls,coach,card_id):
+        card=Card.query.get(card_id)
+        if card is None:
+            raise DustingError(f"Card not found") 
+        if card.duster_id is not None:
+            raise DustingError(f"Card **{card.name}** is already flagged for dusting")     
+        return cls.check_and_dust(coach,card)
+
+    @classmethod
+    def undust_card_by_id(cls,coach,card_id):
+        card=Card.query.get(card_id)
+        if card is None:
+            raise DustingError(f"Card not found") 
+        if card.duster_id is None:
+            raise DustingError(f"Card **{card.name}** is not flagged for dusting")  
+        return cls.check_and_undust(coach,card)
+
+    @classmethod
+    def cancel_duster(cls,coach):
+        duster = cls.get_duster(coach)
+        if duster.status!="OPEN":
+            raise DustingError(f"Cannot cancel dusting. It has been already committed.")
+        db.session.delete(coach.duster)
+        db.session.commit()
+
+    @classmethod
+    def commit_duster(cls,coach):
+        duster = cls.get_duster(coach)
+        if len(duster.cards)<10:
+            raise DustingError("Not enough cards flagged for dusting. Need 10!!!")
+
+        reason = f"{duster.type}: {';'.join([card.name for card in duster.cards])}"
+        t = Transaction(description=reason,price=0)
+        cards = duster.cards
+        for card in cards:
+            db.session.delete(card)
+        duster.status="COMMITTED"
+        coach.make_transaction(t)
+        NotificationService.notify(f"<@{coach.disc_id}>: Card(s) **{' ,'.join([card.name for card in cards])}** removed from your collection by {duster.type}")
+        return True
+
+class DustingError(Exception):
+    pass
 
 class RegistrationError(Exception):
     pass
@@ -479,3 +593,11 @@ class InvalidQuality(Exception):
 
 class InvalidPackType(Exception):
     pass
+
+class WebHook:
+    def __init__(self,webhook):
+        self.webhook = webhook
+
+    def send(self,msg):
+        requests.post(self.webhook, json={'content': msg})
+
